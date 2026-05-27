@@ -30,6 +30,7 @@ const (
 	DockerRouterLabelAutoScaleDown        = "mc-router.auto-scale-down"
 	DockerRouterLabelAutoScaleAsleepMOTD  = "mc-router.auto-scale-asleep-motd"
 	DockerRouterLabelAutoScaleLoadingMOTD = "mc-router.auto-scale-loading-motd"
+	DockerRouterLabelAutoScaleWith        = "mc-router.auto-scale-with"
 )
 
 type dockerWatcherConfig struct {
@@ -67,7 +68,55 @@ type dockerWatcherImpl struct {
 	config       dockerWatcherConfig
 	client       *client.Client
 	containerMap map[string]*routableContainer
+	sidecars     map[string]*sidecarContainer
 	monitorLock  sync.Mutex
+}
+
+func (w *dockerWatcherImpl) startContainer(ctx context.Context, containerID string) error {
+	inspect, err := w.client.ContainerInspect(ctx, containerID)
+	if err != nil {
+		return err
+	}
+	if inspect.State == nil {
+		return fmt.Errorf("unable to determine container state")
+	}
+	if inspect.State.Paused {
+		logrus.WithFields(logrus.Fields{"containerID": containerID}).Debug("Unpausing container")
+		if err := w.client.ContainerUnpause(ctx, containerID); err != nil {
+			return err
+		}
+	} else if !inspect.State.Running {
+		logrus.WithFields(logrus.Fields{"containerID": containerID}).Debug("Starting container")
+		if err := w.client.ContainerStart(ctx, containerID, container.StartOptions{}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (w *dockerWatcherImpl) stopContainer(ctx context.Context, containerID string) error {
+	inspect, err := w.client.ContainerInspect(ctx, containerID)
+	if err != nil {
+		return err
+	}
+	if inspect.State != nil && inspect.State.Running {
+		timeout := 60
+		logrus.WithFields(logrus.Fields{"containerID": containerID}).Debug("Stopping container")
+		if err := w.client.ContainerStop(ctx, containerID, container.StopOptions{Timeout: &timeout}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (w *dockerWatcherImpl) anyDependencyRunning(dependencies []string) bool {
+	for _, host := range dependencies {
+		if rc, ok := w.containerMap[host]; ok && rc.containerEndpoint != "" {
+			logrus.WithField("host", host).Debug("Dependency is running")
+			return true
+		}
+	}
+	return false
 }
 
 func (w *dockerWatcherImpl) makeWakerFunc(rc *routableContainer) WakerFunc {
@@ -79,27 +128,12 @@ func (w *dockerWatcherImpl) makeWakerFunc(rc *routableContainer) WakerFunc {
 		if containerID == "" {
 			return "", fmt.Errorf("missing container id for wake")
 		}
-		inspect, err := w.client.ContainerInspect(ctx, containerID)
-		if err != nil {
+
+		if err := w.startContainer(ctx, containerID); err != nil {
 			return "", err
 		}
-		if inspect.State == nil {
-			return "", fmt.Errorf("unable to determine container state")
-		}
-		// If paused, unpause; if not running, start; otherwise no-op
-		if inspect.State.Paused {
-			logrus.WithFields(logrus.Fields{"containerID": containerID}).Debug("Unpausing container for wake")
-			if err := w.client.ContainerUnpause(ctx, containerID); err != nil {
-				return "", err
-			}
-		} else if !inspect.State.Running {
-			logrus.WithFields(logrus.Fields{"containerID": containerID}).Debug("Starting container for wake")
-			if err := w.client.ContainerStart(ctx, containerID, container.StartOptions{}); err != nil {
-				return "", err
-			}
-		}
 
-		inspect, err = w.client.ContainerInspect(ctx, containerID)
+		inspect, err := w.client.ContainerInspect(ctx, containerID)
 		if err != nil {
 			return "", err
 		}
@@ -148,20 +182,7 @@ func (w *dockerWatcherImpl) makeSleeperFunc(rc *routableContainer) SleeperFunc {
 		if containerID == "" {
 			return fmt.Errorf("missing container id for sleep")
 		}
-		inspect, err := w.client.ContainerInspect(ctx, containerID)
-		if err != nil {
-			return err
-		}
-		if inspect.State != nil && inspect.State.Running {
-			// Graceful stop with 60s timeout
-			timeout := 60
-			logrus.WithFields(logrus.Fields{"containerID": containerID}).Debug("Stopping container for sleep")
-			if err := w.client.ContainerStop(ctx, containerID, container.StopOptions{Timeout: &timeout}); err != nil {
-				return err
-			}
-		}
-		// Route table updates via Docker `die`/`stop`/`network disconnect` events.
-		return nil
+		return w.stopContainer(ctx, containerID)
 	}
 }
 
@@ -174,24 +195,37 @@ func (w *dockerWatcherImpl) monitorContainers(ctx context.Context) error {
 	defer w.monitorLock.Unlock()
 
 	logrus.Trace("Listing Docker containers")
-	containers, err := w.listContainers(ctx)
+	rcs, sidecars, err := w.listContainers(ctx)
 	if err != nil {
 		logrus.WithError(err).Error("Docker failed to list containers")
 		return err
 	}
 
 	byID := map[string][]*routableContainer{}
-	for _, rc := range containers {
+	for _, rc := range rcs {
 		byID[rc.containerID] = append(byID[rc.containerID], rc)
 	}
+	sidecarsByID := map[string]*sidecarContainer{}
+	for _, s := range sidecars {
+		sidecarsByID[s.containerID] = s
+	}
 
-	for id, desired := range byID {
-		w.applyContainerRoutesLocked(id, desired)
+	// We need to iterate over ALL IDs that were found (either as rcs or sidecars)
+	allIDs := map[string]bool{}
+	for id := range byID {
+		allIDs[id] = true
+	}
+	for id := range sidecarsByID {
+		allIDs[id] = true
+	}
+
+	for id := range allIDs {
+		w.applyContainerRoutesLocked(ctx, id, byID[id], sidecarsByID[id])
 	}
 
 	// Remove entries whose container is no longer present at all
 	for name, rc := range w.containerMap {
-		if _, present := byID[rc.containerID]; present {
+		if _, present := allIDs[rc.containerID]; present {
 			continue
 		}
 		delete(w.containerMap, name)
@@ -202,6 +236,14 @@ func (w *dockerWatcherImpl) monitorContainers(ctx context.Context) error {
 		}
 		logrus.WithField("routableContainer", rc).Debug("DELETE")
 	}
+
+	// Remove sidecars that are no longer present
+	for id := range w.sidecars {
+		if !allIDs[id] {
+			delete(w.sidecars, id)
+		}
+	}
+
 	return nil
 }
 
@@ -218,12 +260,14 @@ func (w *dockerWatcherImpl) applyEvent(ctx context.Context, ev events.Message) e
 	}
 
 	var desired []*routableContainer
+	var sidecar *sidecarContainer
 	if !(ev.Type == events.ContainerEventType && ev.Action == events.ActionDestroy) {
-		got, err := w.containersForID(ctx, containerID)
+		got, sc, err := w.containersForID(ctx, containerID)
 		if err != nil {
 			return err
 		}
 		desired = got
+		sidecar = sc
 	}
 
 	w.monitorLock.Lock()
@@ -231,7 +275,7 @@ func (w *dockerWatcherImpl) applyEvent(ctx context.Context, ev events.Message) e
 
 	// Only trace events that affect a routed container — either one we already
 	// track or one becoming routable now. Filters out unrelated daemon noise.
-	relevant := len(desired) > 0
+	relevant := len(desired) > 0 || sidecar != nil
 	if !relevant {
 		for _, rc := range w.containerMap {
 			if rc.containerID == containerID {
@@ -240,27 +284,32 @@ func (w *dockerWatcherImpl) applyEvent(ctx context.Context, ev events.Message) e
 			}
 		}
 	}
+	if !relevant {
+		if _, exists := w.sidecars[containerID]; exists {
+			relevant = true
+		}
+	}
 	if relevant {
 		logrus.WithFields(logrus.Fields{"type": ev.Type, "action": ev.Action, "id": containerID}).Trace("Docker event")
 	}
 
-	w.applyContainerRoutesLocked(containerID, desired)
+	w.applyContainerRoutesLocked(ctx, containerID, desired, sidecar)
 	return nil
 }
 
 // containersForID inspects a single container and returns the routableContainers
 // it should produce. Returns nil if the container is gone or not routable.
-func (w *dockerWatcherImpl) containersForID(ctx context.Context, containerID string) ([]*routableContainer, error) {
+func (w *dockerWatcherImpl) containersForID(ctx context.Context, containerID string) ([]*routableContainer, *sidecarContainer, error) {
 	inspect, err := w.client.ContainerInspect(ctx, containerID)
 	if err != nil {
 		if cerrdefs.IsNotFound(err) {
-			return nil, nil
+			return nil, nil, nil
 		}
-		return nil, err
+		return nil, nil, err
 	}
 	data, ok := w.parseContainerData(&inspect)
 	if !ok {
-		return nil, nil
+		return nil, nil, nil
 	}
 	endpoint := ""
 	if !data.notRunning {
@@ -289,16 +338,25 @@ func (w *dockerWatcherImpl) containersForID(ctx context.Context, containerID str
 			autoScaleLoadingMOTD:  data.autoScaleLoadingMOTD,
 		})
 	}
-	return result, nil
+	var sidecar *sidecarContainer
+	if len(data.autoScaleWith) > 0 {
+		sidecar = &sidecarContainer{
+			containerID:   containerID,
+			autoScaleWith: data.autoScaleWith,
+		}
+	}
+	return result, sidecar, nil
 }
 
 // applyContainerRoutesLocked reconciles the routes for a single containerID
 // against the desired set. Caller must hold monitorLock.
-func (w *dockerWatcherImpl) applyContainerRoutesLocked(containerID string, desired []*routableContainer) {
+func (w *dockerWatcherImpl) applyContainerRoutesLocked(ctx context.Context, containerID string, desired []*routableContainer, sidecar *sidecarContainer) {
 	desiredByName := map[string]*routableContainer{}
 	for _, rc := range desired {
 		desiredByName[rc.externalContainerName] = rc
 	}
+
+	var hostsAffected []string
 
 	// Drop entries previously owned by this container that are no longer desired
 	for name, rc := range w.containerMap {
@@ -315,6 +373,7 @@ func (w *dockerWatcherImpl) applyContainerRoutesLocked(containerID string, desir
 			Routes.SetDefaultRoute("", "", nil, nil, "", "")
 		}
 		logrus.WithField("routableContainer", rc).Debug("DELETE")
+		hostsAffected = append(hostsAffected, name)
 	}
 
 	for _, rs := range desired {
@@ -329,6 +388,7 @@ func (w *dockerWatcherImpl) applyContainerRoutesLocked(containerID string, desir
 				Routes.SetDefaultRoute(rs.containerEndpoint, "", wakerFunc, sleeperFunc, rs.autoScaleAsleepMOTD, rs.autoScaleLoadingMOTD)
 			}
 			logrus.WithField("routableContainer", rs).Debug("ADD")
+			hostsAffected = append(hostsAffected, rs.externalContainerName)
 			continue
 		}
 		if oldRs.containerEndpoint == rs.containerEndpoint &&
@@ -349,6 +409,42 @@ func (w *dockerWatcherImpl) applyContainerRoutesLocked(containerID string, desir
 			Routes.SetDefaultRoute(rs.containerEndpoint, "", wakerFunc, sleeperFunc, rs.autoScaleAsleepMOTD, rs.autoScaleLoadingMOTD)
 		}
 		logrus.WithFields(logrus.Fields{"old": oldRs, "new": rs}).Debug("UPDATE")
+		hostsAffected = append(hostsAffected, rs.externalContainerName)
+	}
+
+	// Update sidecars map
+	if sidecar != nil {
+		w.sidecars[containerID] = sidecar
+	} else {
+		delete(w.sidecars, containerID)
+	}
+
+	// Process sidecars affected by any host state changes
+	if len(hostsAffected) > 0 {
+		w.RLock()
+		affectedSidecars := make(map[string]*sidecarContainer)
+		for sid, s := range w.sidecars {
+			for _, h := range s.autoScaleWith {
+				for _, affected := range hostsAffected {
+					if h == affected {
+						affectedSidecars[sid] = s
+						break
+					}
+				}
+				if _, ok := affectedSidecars[sid]; ok {
+					break
+				}
+			}
+		}
+		w.RUnlock()
+
+		for sid, s := range affectedSidecars {
+			if w.anyDependencyRunning(s.autoScaleWith) {
+				_ = w.startContainer(ctx, sid)
+			} else {
+				_ = w.stopContainer(ctx, sid)
+			}
+		}
 	}
 }
 
@@ -372,6 +468,7 @@ func (w *dockerWatcherImpl) Start(ctx context.Context) error {
 		return err
 	}
 	w.containerMap = map[string]*routableContainer{}
+	w.sidecars = map[string]*sidecarContainer{}
 
 	logrus.Trace("Performing initial listing of Docker containers")
 	if err := w.monitorContainers(ctx); err != nil {
@@ -460,57 +557,27 @@ func (w *dockerWatcherImpl) streamEvents(ctx context.Context) {
 	}
 }
 
-func (w *dockerWatcherImpl) listContainers(ctx context.Context) ([]*routableContainer, error) {
+func (w *dockerWatcherImpl) listContainers(ctx context.Context) ([]*routableContainer, []*sidecarContainer, error) {
 	containers, err := w.client.ContainerList(ctx, container.ListOptions{All: true})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	var result []*routableContainer
+	var sidecars []*sidecarContainer
 	for _, container := range containers {
-		inspect, err := w.client.ContainerInspect(ctx, container.ID)
+		rcs, sidecar, err := w.containersForID(ctx, container.ID)
 		if err != nil {
-			logrus.WithFields(logrus.Fields{"containerID": container.ID}).WithError(err).Error("Failed to inspect Docker container")
+			logrus.WithFields(logrus.Fields{"containerID": container.ID}).WithError(err).Error("Failed to get routable info for Docker container")
 			continue
 		}
-		data, ok := w.parseContainerData(&inspect)
-		if !ok {
-			continue
-		}
-
-		endpoint := ""
-		if !data.notRunning {
-			endpoint = fmt.Sprintf("%s:%d", data.ip, data.port)
-		}
-		logrus.WithField("backendEndpoint", endpoint).
-			WithField("containerID", container.ID).
-			Debug("Found routable Docker container")
-
-		for _, host := range data.hosts {
-			result = append(result, &routableContainer{
-				containerEndpoint:     endpoint,
-				externalContainerName: host,
-				containerID:           container.ID,
-				autoScaleUp:           data.autoScaleUp,
-				autoScaleDown:         data.autoScaleDown,
-				autoScaleAsleepMOTD:   data.autoScaleAsleepMOTD,
-				autoScaleLoadingMOTD:  data.autoScaleLoadingMOTD,
-			})
-		}
-		if data.def != nil && *data.def {
-			result = append(result, &routableContainer{
-				containerEndpoint:     endpoint,
-				externalContainerName: "",
-				containerID:           container.ID,
-				autoScaleUp:           data.autoScaleUp,
-				autoScaleDown:         data.autoScaleDown,
-				autoScaleAsleepMOTD:   data.autoScaleAsleepMOTD,
-				autoScaleLoadingMOTD:  data.autoScaleLoadingMOTD,
-			})
+		result = append(result, rcs...)
+		if sidecar != nil {
+			sidecars = append(sidecars, sidecar)
 		}
 	}
 
-	return result, nil
+	return result, sidecars, nil
 }
 
 type parsedDockerContainerData struct {
@@ -523,7 +590,13 @@ type parsedDockerContainerData struct {
 	autoScaleUp          bool
 	autoScaleAsleepMOTD  string
 	autoScaleLoadingMOTD string
+	autoScaleWith        []string
 	notRunning           bool
+}
+
+type sidecarContainer struct {
+	containerID   string
+	autoScaleWith []string
 }
 
 func (w *dockerWatcherImpl) parseContainerData(container *container.InspectResponse) (data parsedDockerContainerData, ok bool) {
@@ -604,10 +677,13 @@ func (w *dockerWatcherImpl) parseContainerData(container *container.InspectRespo
 		if key == DockerRouterLabelAutoScaleLoadingMOTD {
 			data.autoScaleLoadingMOTD = value
 		}
+		if key == DockerRouterLabelAutoScaleWith {
+			data.autoScaleWith = SplitExternalHosts(value)
+		}
 	}
 
 	// probably not minecraft related
-	if len(data.hosts) == 0 {
+	if len(data.hosts) == 0 && len(data.autoScaleWith) == 0 {
 		return
 	}
 

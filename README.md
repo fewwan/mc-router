@@ -189,6 +189,7 @@ These are the labels scanned:
 - `mc-router.auto-scale-asleep-motd`: Per-container override for MOTD to show when container is scaled to zero. If empty or not set the host will
 appear unresponsive.
 - `mc-router.auto-scale-loading-motd`: Per-container override for MOTD to show while the container is waking and not yet reachable. If empty or not set, the global `-auto-scale-loading-motd` value is used.
+- `mc-router.auto-scale-with`: Used for sidecar containers that should scale with one or more hostnames. When any container serving the specified hostname(s) starts, this container will also be started. It will only be stopped once all containers serving its dependent hostnames have stopped.
 
 #### Docker Auto Scale Up/Down
 
