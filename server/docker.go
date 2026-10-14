@@ -31,6 +31,7 @@ const (
 	DockerRouterLabelNetwork                   = "mc-router.network"
 	DockerRouterLabelAutoScaleUp               = "mc-router.auto-scale-up"
 	DockerRouterLabelAutoScaleDown             = "mc-router.auto-scale-down"
+	DockerRouterLabelAutoScaleWith             = "mc-router.auto-scale-with"
 	DockerRouterLabelAutoScaleAsleepMOTD       = "mc-router.auto-scale-asleep-motd"
 	DockerRouterLabelAutoScaleLoadingMOTD      = "mc-router.auto-scale-loading-motd"
 	DockerRouterLabelAutoScaleWaitTimeout      = "mc-router.auto-scale-wait-timeout"
@@ -89,11 +90,29 @@ func NewDockerWatcher(socket string, timeout time.Duration, autoScaleUp bool, au
 
 type dockerWatcherImpl struct {
 	sync.RWMutex
-	config       dockerWatcherConfig
-	client       *client.Client
-	containerMap map[string]*routableContainer
-	monitorLock  sync.Mutex
-	routes       IRoutes
+	config         dockerWatcherConfig
+	client         *client.Client
+	containerMap   map[string]*routableContainer
+	sidecars       map[string]*dockerSidecar
+	sidecarOpsLock sync.Mutex
+	monitorLock    sync.Mutex
+	routes         IRoutes
+}
+
+// dockerSidecar is a container kept running while any of the backends it names
+// is running, and stopped once all of them have stopped.
+type dockerSidecar struct {
+	containerId string
+	name        string
+	hosts       []string
+	running     bool
+}
+
+func (s *dockerSidecar) String() string {
+	if s == nil {
+		return ""
+	}
+	return fmt.Sprintf("dockerSidecar{containerId=%s, name=%s, hosts=%v, running=%t}", shortContainerId(s.containerId), s.name, s.hosts, s.running)
 }
 
 func (w *dockerWatcherImpl) makeWakerFunc(rc *routableContainer) WakerFunc {
@@ -105,27 +124,11 @@ func (w *dockerWatcherImpl) makeWakerFunc(rc *routableContainer) WakerFunc {
 		if containerId == "" {
 			return "", fmt.Errorf("missing container id for wake")
 		}
-		inspect, err := w.client.ContainerInspect(ctx, containerId)
-		if err != nil {
+		if err := w.ensureContainerRunning(ctx, containerId); err != nil {
 			return "", err
 		}
-		if inspect.State == nil {
-			return "", fmt.Errorf("unable to determine container state")
-		}
-		// If paused, unpause; if not running, start; otherwise no-op
-		if inspect.State.Paused {
-			logrus.WithFields(logrus.Fields{"containerId": containerId}).Debug("Unpausing container for wake")
-			if err := w.client.ContainerUnpause(ctx, containerId); err != nil {
-				return "", err
-			}
-		} else if !inspect.State.Running {
-			logrus.WithFields(logrus.Fields{"containerId": containerId}).Debug("Starting container for wake")
-			if err := w.client.ContainerStart(ctx, containerId, container.StartOptions{}); err != nil {
-				return "", err
-			}
-		}
 
-		inspect, err = w.client.ContainerInspect(ctx, containerId)
+		inspect, err := w.client.ContainerInspect(ctx, containerId)
 		if err != nil {
 			return "", err
 		}
@@ -174,21 +177,145 @@ func (w *dockerWatcherImpl) makeSleeperFunc(rc *routableContainer) SleeperFunc {
 		if containerId == "" {
 			return fmt.Errorf("missing container id for sleep")
 		}
-		inspect, err := w.client.ContainerInspect(ctx, containerId)
-		if err != nil {
-			return err
-		}
-		if inspect.State != nil && inspect.State.Running {
-			// Graceful stop with 60s timeout
-			timeout := 60
-			logrus.WithFields(logrus.Fields{"containerId": containerId}).Debug("Stopping container for sleep")
-			if err := w.client.ContainerStop(ctx, containerId, container.StopOptions{Timeout: &timeout}); err != nil {
-				return err
-			}
-		}
-		// Route table updates via Docker `die`/`stop`/`network disconnect` events.
-		return nil
+		return w.stopContainer(ctx, containerId)
 	}
+}
+
+// ensureContainerRunning starts or unpauses the container if it is not running.
+func (w *dockerWatcherImpl) ensureContainerRunning(ctx context.Context, containerId string) error {
+	inspect, err := w.client.ContainerInspect(ctx, containerId)
+	if err != nil {
+		return err
+	}
+	if inspect.State == nil {
+		return fmt.Errorf("unable to determine container state")
+	}
+	// If paused, unpause; if not running, start; otherwise no-op
+	if inspect.State.Paused {
+		logrus.WithFields(logrus.Fields{"containerId": containerId}).Debug("Unpausing container for wake")
+		return w.client.ContainerUnpause(ctx, containerId)
+	}
+	if !inspect.State.Running {
+		logrus.WithFields(logrus.Fields{"containerId": containerId}).Debug("Starting container for wake")
+		return w.client.ContainerStart(ctx, containerId, container.StartOptions{})
+	}
+	return nil
+}
+
+// stopContainer gracefully stops the container if it is running.
+func (w *dockerWatcherImpl) stopContainer(ctx context.Context, containerId string) error {
+	inspect, err := w.client.ContainerInspect(ctx, containerId)
+	if err != nil {
+		return err
+	}
+	if inspect.State != nil && inspect.State.Running {
+		// Graceful stop with 60s timeout
+		timeout := 60
+		logrus.WithFields(logrus.Fields{"containerId": containerId}).Debug("Stopping container for sleep")
+		return w.client.ContainerStop(ctx, containerId, container.StopOptions{Timeout: &timeout})
+	}
+	return nil
+}
+
+// reconcileSidecarsLocked returns the sidecar container IDs whose running state
+// no longer matches the desired one: a sidecar runs while any of its backends
+// is running and stops once all of them have stopped.
+// Caller must hold monitorLock.
+func (w *dockerWatcherImpl) reconcileSidecarsLocked() (starts, stops []string) {
+	for containerId, sidecar := range w.sidecars {
+		running := w.anyBackendRunningLocked(sidecar.hosts)
+		switch {
+		case running && !sidecar.running:
+			starts = append(starts, containerId)
+		case !running && sidecar.running:
+			stops = append(stops, containerId)
+		}
+	}
+	slices.Sort(starts)
+	slices.Sort(stops)
+	return
+}
+
+// anyBackendRunningLocked reports whether any backend named by hosts is
+// currently running. Caller must hold monitorLock.
+func (w *dockerWatcherImpl) anyBackendRunningLocked(hosts []string) bool {
+	for _, host := range hosts {
+		if rc, ok := w.containerMap[host]; ok && rc.running {
+			return true
+		}
+	}
+	return false
+}
+
+// performSidecarChanges starts and stops sidecars to match the desired state.
+// It is serialized and best-effort: failures are logged and never affect the
+// backend's own scaling.
+func (w *dockerWatcherImpl) performSidecarChanges(ctx context.Context, starts, stops []string) {
+	if len(starts) == 0 && len(stops) == 0 {
+		return
+	}
+	w.sidecarOpsLock.Lock()
+	defer w.sidecarOpsLock.Unlock()
+	for _, containerId := range starts {
+		if err := w.ensureContainerRunning(ctx, containerId); err != nil {
+			logrus.WithError(err).WithField("containerId", shortContainerId(containerId)).Warn("Failed to start sidecar container")
+			continue
+		}
+		logrus.WithField("containerId", shortContainerId(containerId)).Debug("Started sidecar container")
+	}
+	for _, containerId := range stops {
+		if err := w.stopContainer(ctx, containerId); err != nil {
+			logrus.WithError(err).WithField("containerId", shortContainerId(containerId)).Warn("Failed to stop sidecar container")
+			continue
+		}
+		logrus.WithField("containerId", shortContainerId(containerId)).Debug("Stopped sidecar container")
+	}
+}
+
+// performSidecarChangesAsync runs performSidecarChanges without blocking the
+// caller (e.g. the Docker event loop) on slow container stops.
+func (w *dockerWatcherImpl) performSidecarChangesAsync(ctx context.Context, starts, stops []string) {
+	if len(starts) == 0 && len(stops) == 0 {
+		return
+	}
+	go w.performSidecarChanges(ctx, starts, stops)
+}
+
+// setContainerSidecarsLocked records or clears the sidecar registration for a
+// single container. Caller must hold monitorLock.
+func (w *dockerWatcherImpl) setContainerSidecarsLocked(containerId string, sidecar *dockerSidecar) {
+	existing, tracked := w.sidecars[containerId]
+	if sidecar == nil || len(sidecar.hosts) == 0 {
+		if !tracked {
+			return
+		}
+		delete(w.sidecars, containerId)
+		logrus.WithField("sidecar", existing).Debug("DELETE")
+		return
+	}
+	if tracked {
+		existing.running = sidecar.running
+		if !slices.Equal(existing.hosts, sidecar.hosts) {
+			existing.hosts = sidecar.hosts
+			logrus.WithField("sidecar", existing).Debug("UPDATE")
+		}
+		return
+	}
+	w.sidecars[containerId] = sidecar
+	logrus.WithField("sidecar", sidecar).Debug("ADD")
+}
+
+// replaceSidecarsLocked replaces the tracked sidecar set from a full listing.
+// Caller must hold monitorLock.
+func (w *dockerWatcherImpl) replaceSidecarsLocked(sidecars []*dockerSidecar) {
+	next := make(map[string]*dockerSidecar, len(sidecars))
+	for _, sc := range sidecars {
+		if sc == nil || len(sc.hosts) == 0 {
+			continue
+		}
+		next[sc.containerId] = sc
+	}
+	w.sidecars = next
 }
 
 // monitorContainers does a full re-list of Docker containers and reconciles
@@ -197,11 +324,11 @@ func (w *dockerWatcherImpl) makeSleeperFunc(rc *routableContainer) SleeperFunc {
 // during disconnect).
 func (w *dockerWatcherImpl) monitorContainers(ctx context.Context) error {
 	w.monitorLock.Lock()
-	defer w.monitorLock.Unlock()
 
 	logrus.Trace("Listing Docker containers")
-	containers, err := w.listContainers(ctx)
+	containers, sidecars, err := w.listContainers(ctx)
 	if err != nil {
+		w.monitorLock.Unlock()
 		logrus.WithError(err).Error("Docker failed to list containers")
 		return err
 	}
@@ -228,6 +355,12 @@ func (w *dockerWatcherImpl) monitorContainers(ctx context.Context) error {
 		}
 		logrus.WithField("routableContainer", rc).Debug("DELETE")
 	}
+
+	w.replaceSidecarsLocked(sidecars)
+	starts, stops := w.reconcileSidecarsLocked()
+	w.monitorLock.Unlock()
+
+	w.performSidecarChangesAsync(ctx, starts, stops)
 	return nil
 }
 
@@ -244,16 +377,17 @@ func (w *dockerWatcherImpl) applyEvent(ctx context.Context, ev events.Message) e
 	}
 
 	var desired []*routableContainer
+	var sidecar *dockerSidecar
 	if !(ev.Type == events.ContainerEventType && ev.Action == events.ActionDestroy) {
-		got, err := w.containersForID(ctx, containerId)
+		got, sc, err := w.containersForID(ctx, containerId)
 		if err != nil {
 			return err
 		}
 		desired = got
+		sidecar = sc
 	}
 
 	w.monitorLock.Lock()
-	defer w.monitorLock.Unlock()
 
 	// Only trace events that affect a routed container — either one we already
 	// track or one becoming routable now. Filters out unrelated daemon noise.
@@ -271,23 +405,36 @@ func (w *dockerWatcherImpl) applyEvent(ctx context.Context, ev events.Message) e
 	}
 
 	w.applyContainerRoutesLocked(containerId, desired)
+	w.setContainerSidecarsLocked(containerId, sidecar)
+	starts, stops := w.reconcileSidecarsLocked()
+	w.monitorLock.Unlock()
+
+	w.performSidecarChangesAsync(ctx, starts, stops)
 	return nil
 }
 
-// containersForID inspects a single container and returns the routableContainers
-// it should produce. Returns nil if the container is gone or not routable.
-func (w *dockerWatcherImpl) containersForID(ctx context.Context, containerId string) ([]*routableContainer, error) {
+// containersForID inspects a single container and returns its routableContainers
+// and sidecar. Returns nil if the container is gone or not relevant.
+func (w *dockerWatcherImpl) containersForID(ctx context.Context, containerId string) ([]*routableContainer, *dockerSidecar, error) {
 	inspect, err := w.client.ContainerInspect(ctx, containerId)
 	if err != nil {
 		if cerrdefs.IsNotFound(err) {
-			return nil, nil
+			return nil, nil, nil
 		}
-		return nil, err
+		return nil, nil, err
 	}
 	data, ok := w.parseContainerData(&inspect)
 	if !ok {
-		return nil, nil
+		return nil, nil, nil
 	}
+
+	sidecar := w.sidecarFor(containerId, data)
+
+	// sidecar-only containers are not routed
+	if len(data.hosts) == 0 {
+		return nil, sidecar, nil
+	}
+
 	endpoint := ""
 	if !data.notRunning {
 		endpoint = dockerBackendEndpoint(data.ip, data.port)
@@ -295,30 +442,25 @@ func (w *dockerWatcherImpl) containersForID(ctx context.Context, containerId str
 	var result []*routableContainer
 	scalingTarget := NewDockerScalingTarget(containerId, data.name)
 	for _, host := range data.hosts {
-		result = append(result, &routableContainer{
-			containerEndpoint:    endpoint,
-			externalName:         host,
-			containerId:          containerId,
-			autoScaleUp:          data.autoScaleUp,
-			autoScaleDown:        data.autoScaleDown,
-			autoScaleAsleepMOTD:  data.autoScaleAsleepMOTD,
-			autoScaleLoadingMOTD: data.autoScaleLoadingMOTD,
-			scalingTarget:        scalingTarget,
-		})
+		result = append(result, newRoutableContainer(endpoint, host, containerId, data, scalingTarget))
 	}
 	if data.def != nil && *data.def {
-		result = append(result, &routableContainer{
-			containerEndpoint:    endpoint,
-			externalName:         "",
-			containerId:          containerId,
-			autoScaleUp:          data.autoScaleUp,
-			autoScaleDown:        data.autoScaleDown,
-			autoScaleAsleepMOTD:  data.autoScaleAsleepMOTD,
-			autoScaleLoadingMOTD: data.autoScaleLoadingMOTD,
-			scalingTarget:        scalingTarget,
-		})
+		result = append(result, newRoutableContainer(endpoint, "", containerId, data, scalingTarget))
 	}
-	return result, nil
+	return result, sidecar, nil
+}
+
+// sidecarFor returns the sidecar registration for a container, or nil.
+func (w *dockerWatcherImpl) sidecarFor(containerId string, data parsedDockerContainerData) *dockerSidecar {
+	if len(data.autoScaleWith) == 0 {
+		return nil
+	}
+	return &dockerSidecar{
+		containerId: containerId,
+		name:        data.name,
+		hosts:       data.autoScaleWith,
+		running:     data.running,
+	}
 }
 
 // applyContainerRoutesLocked reconciles the routes for a single containerId
@@ -365,7 +507,8 @@ func (w *dockerWatcherImpl) applyContainerRoutesLocked(containerId string, desir
 			oldRs.autoScaleUp == rs.autoScaleUp &&
 			oldRs.autoScaleDown == rs.autoScaleDown &&
 			oldRs.autoScaleAsleepMOTD == rs.autoScaleAsleepMOTD &&
-			oldRs.autoScaleLoadingMOTD == rs.autoScaleLoadingMOTD {
+			oldRs.autoScaleLoadingMOTD == rs.autoScaleLoadingMOTD &&
+			oldRs.running == rs.running {
 			continue
 		}
 		w.containerMap[rs.externalName] = rs
@@ -388,6 +531,7 @@ func (w *dockerWatcherImpl) Start(ctx context.Context) error {
 		return err
 	}
 	w.containerMap = map[string]*routableContainer{}
+	w.sidecars = map[string]*dockerSidecar{}
 
 	logrus.Trace("Performing initial listing of Docker containers")
 	if err := w.monitorContainers(ctx); err != nil {
@@ -476,13 +620,14 @@ func (w *dockerWatcherImpl) streamEvents(ctx context.Context) {
 	}
 }
 
-func (w *dockerWatcherImpl) listContainers(ctx context.Context) ([]*routableContainer, error) {
+func (w *dockerWatcherImpl) listContainers(ctx context.Context) ([]*routableContainer, []*dockerSidecar, error) {
 	containers, err := w.client.ContainerList(ctx, container.ListOptions{All: true})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	var result []*routableContainer
+	var sidecars []*dockerSidecar
 	for _, c := range containers {
 		containerId := c.ID
 		inspect, err := w.client.ContainerInspect(ctx, containerId)
@@ -492,6 +637,14 @@ func (w *dockerWatcherImpl) listContainers(ctx context.Context) ([]*routableCont
 		}
 		data, ok := w.parseContainerData(&inspect)
 		if !ok {
+			continue
+		}
+
+		if sidecar := w.sidecarFor(containerId, data); sidecar != nil {
+			sidecars = append(sidecars, sidecar)
+		}
+
+		if len(data.hosts) == 0 {
 			continue
 		}
 
@@ -512,7 +665,7 @@ func (w *dockerWatcherImpl) listContainers(ctx context.Context) ([]*routableCont
 		}
 	}
 
-	return result, nil
+	return result, sidecars, nil
 }
 
 func newRoutableContainer(endpoint string, host string, containerId string, data parsedDockerContainerData, target *DockerScalingTarget) *routableContainer {
@@ -525,6 +678,7 @@ func newRoutableContainer(endpoint string, host string, containerId string, data
 		autoScaleAsleepMOTD:  data.autoScaleAsleepMOTD,
 		autoScaleLoadingMOTD: data.autoScaleLoadingMOTD,
 		scalingTarget:        target,
+		running:              data.running,
 	}
 }
 
@@ -537,9 +691,11 @@ type parsedDockerContainerData struct {
 	ip                   string
 	autoScaleDown        bool
 	autoScaleUp          bool
+	autoScaleWith        []string
 	autoScaleAsleepMOTD  string
 	autoScaleLoadingMOTD string
 	notRunning           bool
+	running              bool
 }
 
 func dockerEndpointIP(endpoint *network.EndpointSettings) string {
@@ -560,6 +716,7 @@ func (w *dockerWatcherImpl) parseContainerData(container *container.InspectRespo
 	data.autoScaleUp = w.config.autoScaleUp
 	data.autoScaleDown = w.config.autoScaleDown
 	data.name = container.Name
+	data.running = container.State != nil && container.State.Running
 	for key, value := range container.Config.Labels {
 		if key == DockerRouterLabelHost {
 			if data.hosts != nil {
@@ -629,6 +786,13 @@ func (w *dockerWatcherImpl) parseContainerData(container *container.InspectRespo
 			}
 			data.autoScaleDown = autoScaleDown
 		}
+		if key == DockerRouterLabelAutoScaleWith {
+			hosts := SplitExternalHosts(value)
+			for i, host := range hosts {
+				hosts[i] = strings.ToLower(host)
+			}
+			data.autoScaleWith = hosts
+		}
 		if key == DockerRouterLabelAutoScaleAsleepMOTD {
 			data.autoScaleAsleepMOTD = value
 		}
@@ -638,7 +802,13 @@ func (w *dockerWatcherImpl) parseContainerData(container *container.InspectRespo
 	}
 
 	// probably not minecraft related
+	if len(data.hosts) == 0 && len(data.autoScaleWith) == 0 {
+		return
+	}
+
+	// sidecar-only containers need no endpoint or network resolution
 	if len(data.hosts) == 0 {
+		ok = true
 		return
 	}
 
@@ -715,11 +885,12 @@ type routableContainer struct {
 	autoScaleAsleepMOTD  string
 	autoScaleLoadingMOTD string
 	scalingTarget        *DockerScalingTarget
+	running              bool
 }
 
 func (r *routableContainer) String() string {
-	return fmt.Sprintf("routableContainer{externalName=%s, endpoint=%s, id=%s, autoScaleUp=%t, autoScaleDown=%t, autoScaleAsleepMOTD=%s, autoScaleLoadingMOTD=%s, scalingTarget=%v}",
-		r.externalName, r.containerEndpoint, shortContainerId(r.containerId), r.autoScaleUp, r.autoScaleDown, r.autoScaleAsleepMOTD, r.autoScaleLoadingMOTD, r.scalingTarget)
+	return fmt.Sprintf("routableContainer{externalName=%s, endpoint=%s, id=%s, autoScaleUp=%t, autoScaleDown=%t, autoScaleAsleepMOTD=%s, autoScaleLoadingMOTD=%s, scalingTarget=%v, running=%t}",
+		r.externalName, r.containerEndpoint, shortContainerId(r.containerId), r.autoScaleUp, r.autoScaleDown, r.autoScaleAsleepMOTD, r.autoScaleLoadingMOTD, r.scalingTarget, r.running)
 }
 
 func shortContainerId(containerId string) string {
